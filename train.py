@@ -8,21 +8,85 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
+import platform
+import runpy
 import gc
 import time
+import json
+import sys
 from dataclasses import dataclass, asdict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, EVAL_TOKENS, Tokenizer, make_dataloader, evaluate_bpb
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+# On Apple Silicon, prefer MLX backend when available.
+backend_pref = os.getenv("AR_BACKEND", "auto").lower()
+is_apple_silicon = platform.system() == "Darwin" and platform.machine() == "arm64"
+if is_apple_silicon and backend_pref in {"auto", "mlx"}:
+    try:
+        import mlx.core as _mx  # noqa: F401
+        print("Dispatching to MLX backend (set AR_BACKEND=torch to force PyTorch).")
+        runpy.run_path(os.path.join(os.path.dirname(__file__), "train_mlx.py"), run_name="__main__")
+        raise SystemExit(0)
+    except Exception as e:
+        if backend_pref == "mlx":
+            raise
+        print(f"MLX backend unavailable ({e}); falling back to PyTorch.")
+        print(
+            "MLX fallback remediation:\n"
+            "  1. Run `uv sync` to install macOS arm64 deps.\n"
+            "  2. Verify MLX import with `uv run python -c \"import mlx.core as mx; print(mx.__version__)\"`.\n"
+            "  3. Use `AR_BACKEND=mlx uv run train.py` to force MLX or `AR_BACKEND=torch` to force PyTorch.\n"
+            "  4. Expected MLX platform: Darwin arm64 (Apple Silicon)."
+        )
+
+
+def get_runtime_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+device = get_runtime_device()
+IS_CUDA = device.type == "cuda"
+IS_MPS = device.type == "mps"
+USE_FA3 = False
+fa3 = None
+if IS_CUDA:
+    from kernels import get_kernel
+    cap = torch.cuda.get_device_capability()
+    # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    fa3 = get_kernel(repo).flash_attn_interface
+    USE_FA3 = True
+
+
+def flash_attention(q, k, v, causal, window_size):
+    # CUDA fast path with FA3 kernels.
+    if USE_FA3:
+        return fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    # Generic fallback for MPS/CPU: SDPA + optional causal masking.
+    if k.size(2) != q.size(2):
+        repeat = q.size(2) // k.size(2)
+        k = k.repeat_interleave(repeat, dim=2)
+        v = v.repeat_interleave(repeat, dim=2)
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    T = q.size(-2)
+    attn_mask = None
+    if causal:
+        idx = torch.arange(T, device=q.device)
+        attn_mask = idx[None, :] <= idx[:, None]
+        if window_size is not None and window_size[0] > 0:
+            attn_mask &= idx[None, :] >= (idx[:, None] - window_size[0] + 1)
+    y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
+    return y.transpose(1, 2).contiguous()
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -89,7 +153,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = flash_attention(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -253,11 +317,18 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+        if IS_CUDA:
+            for shape in sorted({p.shape for p in matrix_params}):
+                group_params = [p for p in matrix_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', params=group_params, lr=matrix_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+                ))
+        else:
+            # MPS/CPU fallback: use AdamW for matrix params for backend compatibility.
             param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+                kind='adamw', params=matrix_params, lr=matrix_lr * dmodel_lr_scale,
+                betas=adam_betas, eps=1e-10, weight_decay=weight_decay,
             ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
@@ -301,7 +372,6 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
@@ -312,7 +382,6 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
@@ -352,22 +421,28 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
 
+if IS_CUDA:
+    adamw_step_fused = torch.compile(adamw_step_fused, dynamic=False, fullgraph=True)
+    muon_step_fused = torch.compile(muon_step_fused, dynamic=False, fullgraph=True)
+
+
 class MuonAdamW(torch.optim.Optimizer):
     """Combined optimizer: Muon for 2D matrix params, AdamW for others."""
 
     def __init__(self, param_groups):
         super().__init__(param_groups, defaults={})
-        # 0-D CPU tensors to avoid torch.compile recompilation when values change
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        # Keep scalar tensors on CPU for CUDA compile stability, but colocate on device for MPS/CPU.
+        scalar_device = torch.device("cpu") if IS_CUDA else device
+        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device=scalar_device)
+        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device=scalar_device)
+        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device=scalar_device)
+        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device=scalar_device)
+        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device=scalar_device)
+        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device=scalar_device)
+        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device=scalar_device)
+        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device=scalar_device)
+        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device=scalar_device)
+        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device=scalar_device)
 
     def _step_adamw(self, group):
         for p in group['params']:
@@ -380,15 +455,29 @@ class MuonAdamW(torch.optim.Optimizer):
                 state['exp_avg'] = torch.zeros_like(p)
                 state['exp_avg_sq'] = torch.zeros_like(p)
             state['step'] += 1
-            self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
-            self._adamw_beta1_t.fill_(group['betas'][0])
-            self._adamw_beta2_t.fill_(group['betas'][1])
-            self._adamw_eps_t.fill_(group['eps'])
-            self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step_fused(p, grad, state['exp_avg'], state['exp_avg_sq'],
-                            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+            if IS_CUDA:
+                self._adamw_step_t.fill_(state['step'])
+                self._adamw_lr_t.fill_(group['lr'])
+                self._adamw_beta1_t.fill_(group['betas'][0])
+                self._adamw_beta2_t.fill_(group['betas'][1])
+                self._adamw_eps_t.fill_(group['eps'])
+                self._adamw_wd_t.fill_(group['weight_decay'])
+                adamw_step_fused(p, grad, state['exp_avg'], state['exp_avg_sq'],
+                                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+            else:
+                beta1, beta2 = group['betas']
+                lr = group['lr']
+                eps = group['eps']
+                wd = group['weight_decay']
+                p.mul_(1 - lr * wd)
+                state['exp_avg'].lerp_(grad, 1 - beta1)
+                state['exp_avg_sq'].lerp_(grad.square(), 1 - beta2)
+                bias1 = 1 - beta1 ** state['step']
+                bias2 = 1 - beta2 ** state['step']
+                denom = (state['exp_avg_sq'] / bias2).sqrt() + eps
+                step_size = lr / bias1
+                p.add_(state['exp_avg'] / denom, alpha=-step_size)
 
     def _step_muon(self, group):
         params = group['params']
@@ -448,6 +537,26 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 # Model size
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+PROFILES = {
+    "cuda_fast": dict(depth=DEPTH, window_pattern=WINDOW_PATTERN, total_batch_size=TOTAL_BATCH_SIZE, device_batch_size=DEVICE_BATCH_SIZE),
+    "mps_fast": dict(depth=4, window_pattern="L", total_batch_size=2**16, device_batch_size=8),
+    "cpu_safe": dict(depth=2, window_pattern="L", total_batch_size=2**13, device_batch_size=1),
+}
+profile_name = os.getenv("AR_PROFILE", "auto").lower()
+if profile_name == "auto":
+    profile_name = "cuda_fast" if IS_CUDA else ("mps_fast" if IS_MPS else "cpu_safe")
+if profile_name not in PROFILES:
+    raise ValueError(f"Unknown AR_PROFILE={profile_name}. Available: {sorted(PROFILES)}")
+profile = PROFILES[profile_name]
+DEPTH = profile["depth"]
+WINDOW_PATTERN = profile["window_pattern"]
+TOTAL_BATCH_SIZE = profile["total_batch_size"]
+DEVICE_BATCH_SIZE = min(DEVICE_BATCH_SIZE, profile["device_batch_size"])
+LOOP_EVAL_TOKENS = int(os.getenv("AR_LOOP_EVAL_TOKENS", str(3 * 524288)))
+RUN_RESEARCH_EVAL_DEFAULT = "1" if IS_CUDA else "0"
+RUN_RESEARCH_EVAL = os.getenv("AR_RUN_RESEARCH_EVAL", RUN_RESEARCH_EVAL_DEFAULT) == "1"
+RESEARCH_EVAL_TOKENS = int(os.getenv("AR_RESEARCH_EVAL_TOKENS", str(EVAL_TOKENS)))
+PATTERN_MODE = os.getenv("AR_PATTERN_MODE", "1") == "1"
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -455,15 +564,34 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+if IS_CUDA:
+    torch.cuda.manual_seed(42)
+if PATTERN_MODE:
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+autocast_dtype = torch.bfloat16 if IS_CUDA else (torch.float16 if IS_MPS else torch.bfloat16)
+autocast_ctx = torch.amp.autocast(device_type=device.type, dtype=autocast_dtype)
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
+print(f"Using device backend: {device.type}")
+print(f"Profile: {profile_name}")
+print(f"Per-device batch size: {DEVICE_BATCH_SIZE}")
 print(f"Vocab size: {vocab_size:,}")
+fingerprint = {
+    "python": sys.version.split()[0],
+    "torch": torch.__version__,
+    "backend": device.type,
+    "profile": profile_name,
+    "pattern_mode": PATTERN_MODE,
+    "dtype_autocast": str(autocast_dtype),
+    "loop_eval_tokens": LOOP_EVAL_TOKENS,
+    "research_eval_tokens": RESEARCH_EVAL_TOKENS if RUN_RESEARCH_EVAL else 0,
+}
+print(f"Runtime fingerprint: {json.dumps(fingerprint, sort_keys=True)}")
 
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
@@ -504,9 +632,10 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+if IS_CUDA:
+    model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train", device=device)
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
@@ -540,7 +669,8 @@ total_training_time = 0
 step = 0
 
 while True:
-    torch.cuda.synchronize()
+    if IS_CUDA:
+        torch.cuda.synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
@@ -570,7 +700,8 @@ while True:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
+    if IS_CUDA:
+        torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
 
@@ -609,16 +740,23 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    loop_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, device=device, eval_tokens=LOOP_EVAL_TOKENS)
+    research_bpb = None
+    if RUN_RESEARCH_EVAL:
+        research_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, device=device, eval_tokens=RESEARCH_EVAL_TOKENS)
 
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
 steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024 if IS_CUDA else 0.0
 
 print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
+print(f"loop_bpb:         {loop_bpb:.6f}")
+if research_bpb is not None:
+    print(f"research_bpb:     {research_bpb:.6f}")
+else:
+    print("research_bpb:     skipped (set AR_RUN_RESEARCH_EVAL=1)")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")

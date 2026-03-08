@@ -17,11 +17,17 @@ import argparse
 import pickle
 from multiprocessing import Pool
 
+import numpy as np
 import requests
 import pyarrow.parquet as pq
 import rustbpe
 import tiktoken
 import torch
+
+try:
+    import mlx.core as mx
+except Exception:
+    mx = None
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
@@ -251,6 +257,13 @@ def get_token_bytes(device="cpu"):
         return torch.load(f, map_location=device)
 
 
+def get_token_bytes_mlx():
+    if mx is None:
+        raise RuntimeError("MLX is not available. Install `mlx` to use backend='mlx'.")
+    token_bytes = get_token_bytes(device="cpu")
+    return mx.array(token_bytes.numpy(), dtype=mx.int32)
+
+
 def _document_batches(split, tokenizer_batch_size=128):
     """Infinite iterator over document batches from parquet files."""
     parquet_paths = list_parquet_files()
@@ -272,7 +285,7 @@ def _document_batches(split, tokenizer_batch_size=128):
         epoch += 1
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def make_dataloader(tokenizer, B, T, split, buffer_size=1000, device=None, backend="torch"):
     """
     BOS-aligned dataloader with best-fit packing.
     Every row starts with BOS. Documents packed using best-fit to minimize cropping.
@@ -280,6 +293,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
     100% utilization (no padding).
     """
     assert split in ["train", "val"]
+    assert backend in ["torch", "mlx"]
     row_capacity = T + 1
     batches = _document_batches(split)
     bos_token = tokenizer.get_bos_token_id()
@@ -292,55 +306,97 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
         doc_buffer.extend(token_lists)
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    if backend == "torch":
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        device = torch.device(device)
+        use_pinned_memory = device.type == "cuda"
+        # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
+        row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
+        cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_pinned_memory)
+        device_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+        cpu_inputs = cpu_buffer[:B * T].view(B, T)
+        cpu_targets = cpu_buffer[B * T:].view(B, T)
+        inputs = device_buffer[:B * T].view(B, T)
+        targets = device_buffer[B * T:].view(B, T)
+    else:
+        if mx is None:
+            raise RuntimeError("MLX is not available. Install `mlx` to use backend='mlx'.")
 
     while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
+        if backend == "torch":
+            for row_idx in range(B):
+                pos = 0
+                while pos < row_capacity:
+                    while len(doc_buffer) < buffer_size:
+                        refill_buffer()
 
-                remaining = row_capacity - pos
+                    remaining = row_capacity - pos
 
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
+                    # Find largest doc that fits entirely
+                    best_idx = -1
+                    best_len = 0
+                    for i, doc in enumerate(doc_buffer):
+                        doc_len = len(doc)
+                        if doc_len <= remaining and doc_len > best_len:
+                            best_idx = i
+                            best_len = doc_len
 
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
+                    if best_idx >= 0:
+                        doc = doc_buffer.pop(best_idx)
+                        row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
+                        pos += len(doc)
+                    else:
+                        # No doc fits — crop shortest to fill remaining
+                        shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
+                        doc = doc_buffer.pop(shortest_idx)
+                        row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                        pos += remaining
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
+            cpu_inputs.copy_(row_buffer[:, :-1])
+            cpu_targets.copy_(row_buffer[:, 1:])
+            device_buffer.copy_(cpu_buffer, non_blocking=use_pinned_memory)
+            yield inputs, targets, epoch
+        else:
+            all_rows = []
+            for _ in range(B):
+                row = []
+                pos = 0
+                while pos < row_capacity:
+                    while len(doc_buffer) < buffer_size:
+                        refill_buffer()
+
+                    remaining = row_capacity - pos
+                    best_idx = -1
+                    best_len = 0
+                    for i, doc in enumerate(doc_buffer):
+                        doc_len = len(doc)
+                        if doc_len <= remaining and doc_len > best_len:
+                            best_idx = i
+                            best_len = doc_len
+
+                    if best_idx >= 0:
+                        doc = doc_buffer.pop(best_idx)
+                        row.extend(doc)
+                        pos += len(doc)
+                    else:
+                        shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
+                        doc = doc_buffer.pop(shortest_idx)
+                        row.extend(doc[:remaining])
+                        pos += remaining
+                all_rows.append(row[:row_capacity])
+
+            row_array = mx.array(np.asarray(all_rows, dtype=np.int32))
+            inputs = row_array[:, :-1]
+            targets = row_array[:, 1:]
+            yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_bpb(model, tokenizer, batch_size, device=None, backend="torch", eval_tokens=None):
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
     Sums per-token cross-entropy (in nats), sums target byte lengths,
@@ -348,19 +404,42 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
+    if eval_tokens is None:
+        eval_tokens = EVAL_TOKENS
+    if backend == "torch":
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        token_bytes = get_token_bytes(device=device)
+        val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val", device=device, backend="torch")
+        steps = eval_tokens // (batch_size * MAX_SEQ_LEN)
+        total_nats = 0.0
+        total_bytes = 0
+        for _ in range(steps):
+            x, y, _ = next(val_loader)
+            loss_flat = model(x, y, reduction='none').view(-1)
+            y_flat = y.view(-1)
+            nbytes = token_bytes[y_flat]
+            mask = nbytes > 0
+            total_nats += (loss_flat * mask).sum().item()
+            total_bytes += nbytes.sum().item()
+        return total_nats / (math.log(2) * total_bytes)
+    if mx is None:
+        raise RuntimeError("MLX is not available. Install `mlx` to use backend='mlx'.")
+    token_bytes = get_token_bytes_mlx()
+    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val", backend="mlx")
+    steps = eval_tokens // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
     total_bytes = 0
     for _ in range(steps):
         x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
+        loss_flat = model(x, y, reduction="none").reshape(-1)
+        y_flat = y.reshape(-1)
+        nbytes = mx.take(token_bytes, y_flat, axis=0)
         mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
+        total_nats += mx.sum(loss_flat * mask).item()
+        total_bytes += int(mx.sum(nbytes).item())
+    if total_bytes == 0:
+        return float("inf")
     return total_nats / (math.log(2) * total_bytes)
 
 # ---------------------------------------------------------------------------
